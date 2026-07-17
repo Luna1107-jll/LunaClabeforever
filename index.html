@@ -1047,6 +1047,14 @@
                         </div>
                     </div>
 
+                    <div class="settings-card">
+                        <div class="settings-card-title">☁️ 服务器推送（息屏也能收到提醒）</div>
+                        <div class="settings-card-desc">需要先按教程部署好推送服务器（Cloudflare Worker），把生成的网址填在下面。填好后点"保存并订阅"，此后哪怕锁屏/App被系统冻结，到点也能收到一条"有新消息"的系统通知，点开 App 后内容会正常生成。</div>
+                        <input type="text" id="input-push-worker-url" placeholder="粘贴 Worker 网址，例如 https://xxx.workers.dev" style="width:100%; padding:8px; margin-bottom:8px; border:1px solid var(--border-color); border-radius:6px; font-size:0.78rem; box-sizing:border-box;">
+                        <button class="btn btn-accent" id="btn-save-subscribe-push">保存并订阅</button>
+                        <div id="push-subscribe-status" style="font-size:0.72rem; color:var(--text-muted); margin-top:8px;"></div>
+                    </div>
+
                 </div>
             </div>
 
@@ -1351,6 +1359,8 @@
             document.getElementById('input-letter-proactive-min').value = AppState.letterProactiveMinHours;
             document.getElementById('input-letter-proactive-max').value = AppState.letterProactiveMaxHours;
             document.getElementById('chk-wakelock-enabled').checked = AppState.wakeLockEnabled;
+            const workerUrlInput = document.getElementById('input-push-worker-url');
+            if (workerUrlInput) workerUrlInput.value = getPushWorkerUrl();
         }
 
         async function toggleNotificationSetting(checked) {
@@ -1430,27 +1440,15 @@
         }
 
         function setupPwaManifest() {
+            // 注意：这里特意不再用 Blob 临时生成 manifest 去覆盖静态的 manifest.json 链接。
+            // 因为"添加到主屏幕"要生成一个真正独立的 App（而不是快捷方式），
+            // 安卓系统需要把 manifest 的网址发给谷歌后台去打包，
+            // 而 Blob 生成的是本机临时网址，谷歌服务器访问不到，会导致只能装出个"快捷方式"。
+            // 所以这里只更新浏览器标签页标题，不再动 manifest 本身，
+            // 保证 index.html 头部那个固定的 manifest.json 始终有效。
             try {
-                const iconBase = location.href.split('#')[0].replace(/[^/]*$/, '');
-                const manifest = {
-                    name: (AppState.otherProfile.name || '聊天') + ' · 私人空间',
-                    short_name: AppState.otherProfile.name || '聊天',
-                    start_url: location.href.split('#')[0],
-                    display: 'standalone',
-                    background_color: '#f8f9fa',
-                    theme_color: '#e5989b',
-                    icons: [
-                        { src: iconBase + 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
-                        { src: iconBase + 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'maskable' },
-                        { src: iconBase + 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
-                        { src: iconBase + 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' }
-                    ]
-                };
-                const blob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const link = document.getElementById('pwa-manifest-link') || document.querySelector('link[rel="manifest"]');
-                if (link) link.href = url;
-            } catch(e) { /* 忽略：即便动态更新失败，静态 manifest.json 仍然生效 */ }
+                document.title = (AppState.otherProfile.name || '聊天') + ' · 私人空间';
+            } catch(e) { /* 忽略 */ }
         }
 
         let deferredInstallPrompt = null;
@@ -1473,6 +1471,74 @@
             deferredInstallPrompt.prompt();
             await deferredInstallPrompt.userChoice;
             deferredInstallPrompt = null;
+        }
+
+        // ---- 服务器推送（Cloudflare Worker）相关 ----
+        const VAPID_PUBLIC_KEY_FOR_SUBSCRIBE = "BDoLsTU8AqZMPxv3VCLHEIVbNrX8XI_pH-ea9HWKUe1A0iCTrwbV9bcZ1u2VQKeQGuJNdshSRbFSF4oIoafp88I";
+
+        function urlBase64ToUint8Array(base64String) {
+            const padding = '='.repeat((4 - base64String.length % 4) % 4);
+            const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+            const rawData = atob(base64);
+            const outputArray = new Uint8Array(rawData.length);
+            for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+            return outputArray;
+        }
+
+        function getPushWorkerUrl() {
+            return (localStorage.getItem('push_worker_url') || '').trim().replace(/\/+$/, '');
+        }
+
+        async function subscribeAndSavePush() {
+            const statusEl = document.getElementById('push-subscribe-status');
+            const workerUrl = document.getElementById('input-push-worker-url').value.trim().replace(/\/+$/, '');
+            if (!workerUrl) { statusEl.textContent = '❌ 请先填写 Worker 网址'; return; }
+            localStorage.setItem('push_worker_url', workerUrl);
+            try {
+                if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+                    statusEl.textContent = '❌ 当前浏览器不支持推送订阅（PushManager 不可用）';
+                    return;
+                }
+                if (Notification.permission !== 'granted') {
+                    const perm = await Notification.requestPermission();
+                    if (perm !== 'granted') { statusEl.textContent = '❌ 未获得通知权限，无法订阅推送'; return; }
+                }
+                statusEl.textContent = '⏳ 正在订阅...';
+                const reg = await navigator.serviceWorker.ready;
+                let sub = await reg.pushManager.getSubscription();
+                if (!sub) {
+                    sub = await reg.pushManager.subscribe({
+                        userVisibleOnly: true,
+                        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY_FOR_SUBSCRIBE)
+                    });
+                }
+                const resp = await fetch(workerUrl + '/subscribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ subscription: sub.toJSON() })
+                });
+                if (!resp.ok) throw new Error('服务器返回状态码 ' + resp.status);
+                statusEl.textContent = '✅ 订阅成功！接下来会自动同步消息时间表。';
+                reportScheduleToServer();
+            } catch (e) {
+                statusEl.textContent = '❌ 订阅失败：' + e.message;
+            }
+        }
+
+        async function reportScheduleToServer() {
+            const workerUrl = getPushWorkerUrl();
+            if (!workerUrl) return;
+            try {
+                const body = {};
+                if (AppState.proactiveEnabled && AppState.proactiveNextTime) body.chatNextTime = AppState.proactiveNextTime;
+                if (AppState.letterProactiveNextTime) body.letterNextTime = AppState.letterProactiveNextTime;
+                if (Object.keys(body).length === 0) return;
+                await fetch(workerUrl + '/schedule', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+            } catch (e) { /* 静默失败：不影响本地功能，下次时间表更新时会自动重试 */ }
         }
 
         async function attemptServiceWorkerRegistration() {
@@ -1506,6 +1572,7 @@
             const intervalMs = AppState.proactiveIntervalMinutes * 60 * 1000;
             AppState.proactiveNextTime = Date.now() + intervalMs;
             saveConfig();
+            reportScheduleToServer();
         }
 
         function runProactiveMessageDaemon() {
@@ -2106,6 +2173,7 @@
             const delay = minMs + Math.random() * (maxMs - minMs);
             AppState.letterProactiveNextTime = Date.now() + delay;
             saveConfig();
+            reportScheduleToServer();
         }
 
         function runLetterSystemDaemon() {
@@ -3708,6 +3776,7 @@ nav {
         document.addEventListener("DOMContentLoaded", async () => {
             loadConfig(); await initDB(); await loadChatHistory(); runLetterSystemDaemon(); 
             runProactiveMessageDaemon();
+            reportScheduleToServer();
             populateSettingsInputs();
             updateLetterNavBadge();
 
@@ -4199,6 +4268,8 @@ nav {
                 AppState.readNoReplyMode = this.checked;
                 saveConfig();
             };
+
+            document.getElementById('btn-save-subscribe-push').onclick = subscribeAndSavePush;
 
             document.getElementById('btn-save-proactive').onclick = () => {
                 const intervalVal = parseFloat(document.getElementById('input-proactive-interval').value);
