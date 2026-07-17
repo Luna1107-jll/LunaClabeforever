@@ -15,6 +15,12 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 
+// 简单直连转发：部分浏览器把"是否存在 fetch 监听"作为可安装 PWA 的判断依据之一，
+// 这里不做离线缓存，只是原样放行请求。
+self.addEventListener('fetch', (event) => {
+  event.respondWith(fetch(event.request));
+});
+
 // 点击系统通知时，尝试聚焦已打开的页面，如果没有打开的页面则新开一个
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();

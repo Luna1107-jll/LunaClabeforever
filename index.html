@@ -4,6 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>极简聊天空间</title>
+    <link rel="manifest" id="pwa-manifest-link" href="manifest.json">
+    <link rel="icon" href="icon-192.png">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    <meta name="theme-color" content="#e5989b">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <style>
         /* --- 极简宋体风视觉规范 --- */
         :root {
@@ -1026,10 +1033,11 @@
                             <input type="checkbox" id="chk-wakelock-enabled" style="width:16px; height:16px;">
                             启用屏幕唤醒锁定（App 在前台/后台标签页时尽量不被系统挂起）
                         </label>
+                        <button class="btn btn-accent" id="btn-install-pwa" style="display:none; margin-bottom:10px;" onclick="triggerPwaInstall()">📲 一键添加到主屏幕</button>
                         <div style="font-size:0.68rem; color:var(--text-muted); line-height:1.5;">
                             说明：受限于浏览器安全策略，纯网页应用做不到"App 完全关闭也能收消息"这种程度，这是所有网页应用的共同限制，不是这个 App 特有的问题。以下几点可以显著提升稳定性：<br>
                             1️⃣ 保持这个标签页开着（哪怕切到后台/锁屏），不要把它从最近任务里划掉；<br>
-                            2️⃣ 把这个网页"添加到主屏幕"，用类似 App 的方式打开，系统挂起概率会更低；<br>
+                            2️⃣ 把这个网页"添加到主屏幕"，用类似 App 的方式打开，系统挂起概率会更低（上面出现按钮时可直接点一下）；<br>
                             3️⃣ 上面的"唤醒锁定"开关在你正打开这个页面时会尽量阻止系统把它挂起，锁屏或切走后浏览器仍可能自动释放，这是系统限制，恢复到前台会自动重新申请。
                         </div>
                     </div>
@@ -1408,24 +1416,48 @@
 
         function setupPwaManifest() {
             try {
+                const iconBase = location.href.split('#')[0].replace(/[^/]*$/, '');
                 const manifest = {
                     name: (AppState.otherProfile.name || '聊天') + ' · 私人空间',
                     short_name: AppState.otherProfile.name || '聊天',
                     start_url: location.href.split('#')[0],
                     display: 'standalone',
                     background_color: '#f8f9fa',
-                    theme_color: '#e5989b'
+                    theme_color: '#e5989b',
+                    icons: [
+                        { src: iconBase + 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+                        { src: iconBase + 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'maskable' },
+                        { src: iconBase + 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+                        { src: iconBase + 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' }
+                    ]
                 };
                 const blob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
                 const url = URL.createObjectURL(blob);
-                let link = document.querySelector('link[rel="manifest"]');
-                if (!link) {
-                    link = document.createElement('link');
-                    link.rel = 'manifest';
-                    document.head.appendChild(link);
-                }
-                link.href = url;
-            } catch(e) { /* 忽略 */ }
+                const link = document.getElementById('pwa-manifest-link') || document.querySelector('link[rel="manifest"]');
+                if (link) link.href = url;
+            } catch(e) { /* 忽略：即便动态更新失败，静态 manifest.json 仍然生效 */ }
+        }
+
+        let deferredInstallPrompt = null;
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            deferredInstallPrompt = e;
+            const btn = document.getElementById('btn-install-pwa');
+            if (btn) btn.style.display = 'inline-flex';
+        });
+        window.addEventListener('appinstalled', () => {
+            deferredInstallPrompt = null;
+            const btn = document.getElementById('btn-install-pwa');
+            if (btn) btn.style.display = 'none';
+        });
+        async function triggerPwaInstall() {
+            if (!deferredInstallPrompt) {
+                alert('当前环境未捕获到安装事件，可尝试浏览器菜单中的"添加到主屏幕"。若已经安装过，这里就不会再弹出啦。');
+                return;
+            }
+            deferredInstallPrompt.prompt();
+            await deferredInstallPrompt.userChoice;
+            deferredInstallPrompt = null;
         }
 
         async function attemptServiceWorkerRegistration() {
