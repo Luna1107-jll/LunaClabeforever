@@ -198,7 +198,7 @@
             background: #fff; 
             padding: 10px 14px; 
             border-radius: 10px; 
-            font-size: 0.95rem; 
+            font-size: var(--chat-font-size, 14px); 
             line-height: 1.4; 
             box-shadow: 0 1px 2px rgba(0,0,0,0.01); 
             word-break: break-all;
@@ -1019,6 +1019,21 @@
                         </label>
                     </div>
 
+                    <div class="settings-card">
+                        <div class="settings-card-title">🔒 稳定后台保活</div>
+                        <div class="settings-card-desc" id="keepalive-status-desc">正在检测当前环境支持情况...</div>
+                        <label style="display:flex; align-items:center; gap:8px; font-size:0.85rem; cursor:pointer; margin-bottom:8px;">
+                            <input type="checkbox" id="chk-wakelock-enabled" style="width:16px; height:16px;">
+                            启用屏幕唤醒锁定（App 在前台/后台标签页时尽量不被系统挂起）
+                        </label>
+                        <div style="font-size:0.68rem; color:var(--text-muted); line-height:1.5;">
+                            说明：受限于浏览器安全策略，纯网页应用做不到"App 完全关闭也能收消息"这种程度，这是所有网页应用的共同限制，不是这个 App 特有的问题。以下几点可以显著提升稳定性：<br>
+                            1️⃣ 保持这个标签页开着（哪怕切到后台/锁屏），不要把它从最近任务里划掉；<br>
+                            2️⃣ 把这个网页"添加到主屏幕"，用类似 App 的方式打开，系统挂起概率会更低；<br>
+                            3️⃣ 上面的"唤醒锁定"开关在你正打开这个页面时会尽量阻止系统把它挂起，锁屏或切走后浏览器仍可能自动释放，这是系统限制，恢复到前台会自动重新申请。
+                        </div>
+                    </div>
+
                 </div>
             </div>
 
@@ -1161,6 +1176,8 @@
             proactiveIntervalMinutes: 30,
             proactiveNextTime: 0,
             notificationEnabled: false,
+            wakeLockEnabled: false,
+            chatFontSize: 14,
             letterProactiveMinHours: 24,
             letterProactiveMaxHours: 72,
             letterProactiveNextTime: 0,
@@ -1205,6 +1222,8 @@
                 proactiveIntervalMinutes: AppState.proactiveIntervalMinutes,
                 proactiveNextTime: AppState.proactiveNextTime,
                 notificationEnabled: AppState.notificationEnabled,
+                wakeLockEnabled: AppState.wakeLockEnabled,
+                chatFontSize: AppState.chatFontSize,
                 letterProactiveMinHours: AppState.letterProactiveMinHours,
                 letterProactiveMaxHours: AppState.letterProactiveMaxHours,
                 letterProactiveNextTime: AppState.letterProactiveNextTime,
@@ -1236,6 +1255,8 @@
                 if (typeof config.proactiveIntervalMinutes === 'number') AppState.proactiveIntervalMinutes = config.proactiveIntervalMinutes;
                 if (typeof config.proactiveNextTime === 'number') AppState.proactiveNextTime = config.proactiveNextTime;
                 if (typeof config.notificationEnabled === 'boolean') AppState.notificationEnabled = config.notificationEnabled;
+                if (typeof config.wakeLockEnabled === 'boolean') AppState.wakeLockEnabled = config.wakeLockEnabled;
+                if (typeof config.chatFontSize === 'number') AppState.chatFontSize = config.chatFontSize;
                 if (typeof config.letterProactiveMinHours === 'number') AppState.letterProactiveMinHours = config.letterProactiveMinHours;
                 if (typeof config.letterProactiveMaxHours === 'number') AppState.letterProactiveMaxHours = config.letterProactiveMaxHours;
                 if (typeof config.letterProactiveNextTime === 'number') AppState.letterProactiveNextTime = config.letterProactiveNextTime;
@@ -1316,6 +1337,7 @@
             document.getElementById('chk-notification-enabled').checked = AppState.notificationEnabled && (typeof Notification === 'undefined' || Notification.permission === 'granted');
             document.getElementById('input-letter-proactive-min').value = AppState.letterProactiveMinHours;
             document.getElementById('input-letter-proactive-max').value = AppState.letterProactiveMaxHours;
+            document.getElementById('chk-wakelock-enabled').checked = AppState.wakeLockEnabled;
         }
 
         async function toggleNotificationSetting(checked) {
@@ -1347,15 +1369,90 @@
             if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
             const isAwayFromChat = document.hidden || AppState.currentView !== 'chat';
             if (!isAwayFromChat) return;
+            const body = messageType === 'emoji' ? '[表情]' : (messageType === 'photo' ? '[图片]' : text);
+            const tag = 'chat-msg-' + Date.now();
             try {
-                const body = messageType === 'emoji' ? '[表情]' : text;
-                const notif = new Notification(sender, { body, icon: avatar, tag: 'chat-msg-' + Date.now() });
-                notif.onclick = () => {
-                    window.focus();
-                    switchView('chat');
-                    notif.close();
-                };
+                if (swRegistration && swRegistration.showNotification) {
+                    // 优先走 Service Worker 通知，稳定性通常比页面内直接 new Notification 更好
+                    swRegistration.showNotification(sender, { body, icon: avatar, tag });
+                } else {
+                    const notif = new Notification(sender, { body, icon: avatar, tag });
+                    notif.onclick = () => {
+                        window.focus();
+                        switchView('chat');
+                        notif.close();
+                    };
+                }
             } catch(e) { /* 通知发送失败时静默忽略，不影响主流程 */ }
+        }
+
+        // --- 稳定后台保活模块：唤醒锁定 + PWA 安装清单 + Service Worker（尽力而为，非100%保证） ---
+        let wakeLockSentinel = null;
+        let swRegistration = null;
+
+        async function requestWakeLockIfNeeded() {
+            if (!AppState.wakeLockEnabled) return;
+            if (!('wakeLock' in navigator)) return;
+            try {
+                wakeLockSentinel = await navigator.wakeLock.request('screen');
+                wakeLockSentinel.addEventListener('release', () => { wakeLockSentinel = null; });
+            } catch(e) { /* 系统拒绝或不支持时静默忽略 */ }
+        }
+
+        function releaseWakeLock() {
+            if (wakeLockSentinel) {
+                wakeLockSentinel.release().catch(() => {});
+                wakeLockSentinel = null;
+            }
+        }
+
+        function setupPwaManifest() {
+            try {
+                const manifest = {
+                    name: (AppState.otherProfile.name || '聊天') + ' · 私人空间',
+                    short_name: AppState.otherProfile.name || '聊天',
+                    start_url: location.href.split('#')[0],
+                    display: 'standalone',
+                    background_color: '#f8f9fa',
+                    theme_color: '#e5989b'
+                };
+                const blob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                let link = document.querySelector('link[rel="manifest"]');
+                if (!link) {
+                    link = document.createElement('link');
+                    link.rel = 'manifest';
+                    document.head.appendChild(link);
+                }
+                link.href = url;
+            } catch(e) { /* 忽略 */ }
+        }
+
+        async function attemptServiceWorkerRegistration() {
+            const statusEl = document.getElementById('keepalive-status-desc');
+            if (!('serviceWorker' in navigator)) {
+                if (statusEl) statusEl.innerText = '当前浏览器不支持 Service Worker，后台通知稳定性只能依赖标签页保持开启。';
+                return;
+            }
+            if (location.protocol === 'file:') {
+                if (statusEl) statusEl.innerText = '当前是直接打开本地文件（file://），浏览器不允许在这种模式下注册 Service Worker；把文件部署到 https 网址（比如 GitHub Pages）后此项会自动生效。';
+                return;
+            }
+            try {
+                swRegistration = await navigator.serviceWorker.register('./sw.js');
+                if (statusEl) statusEl.innerText = 'Service Worker 已注册成功，通知稳定性会更好；建议再把本页"添加到主屏幕"效果最佳。';
+            } catch(e) {
+                if (statusEl) statusEl.innerText = '未找到 sw.js（需要和本页面放在同一目录下）或注册失败，通知功能仍会正常工作，只是稳定性回退到普通模式。';
+            }
+        }
+
+        function initStableKeepAlive() {
+            setupPwaManifest();
+            attemptServiceWorkerRegistration();
+            requestWakeLockIfNeeded();
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) { requestWakeLockIfNeeded(); }
+            });
         }
 
         function scheduleNextProactiveMessage() {
@@ -2613,6 +2710,10 @@ nav {
             styleTag.textContent = buildThemeCss();
         }
 
+        function applyChatFontSize() {
+            document.documentElement.style.setProperty('--chat-font-size', (AppState.chatFontSize || 14) + 'px');
+        }
+
         function applyChatBackground() {
             const chatMessages = document.getElementById('chat-box');
             const bodyEl = document.body;
@@ -2780,7 +2881,14 @@ nav {
             openModal(`
                 <div class="modal-title">外观设计</div>
                 <div class="modal-form" style="max-height:64vh; overflow-y:auto;">
-                    <div class="section-title" style="margin-top:0;">🖼️ 聊天背景</div>
+                    <div class="section-title" style="margin-top:0;">🔤 聊天字体大小</div>
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <span style="font-size:0.72rem; color:var(--text-muted); flex-shrink:0;">A</span>
+                        <input type="range" id="input-chat-font-size" min="12" max="20" step="1" style="flex:1;">
+                        <span id="chat-font-size-value" style="font-size:0.72rem; color:var(--text-muted); width:32px; text-align:right; flex-shrink:0;"></span>
+                    </div>
+
+                    <div class="section-title">🖼️ 聊天背景</div>
                     <div style="display:flex; gap:8px;">
                         <label class="btn" style="position:relative; overflow:hidden; flex:1; justify-content:center;">
                             上传背景图片
@@ -2824,6 +2932,17 @@ nav {
             document.getElementById('chk-liquid-glass').checked = AppState.liquidGlassEnabled;
             document.getElementById('input-liquid-blur').value = AppState.liquidGlassBlur || 22;
             document.getElementById('liquid-blur-value').innerText = (AppState.liquidGlassBlur || 22) + 'px';
+            document.getElementById('input-chat-font-size').value = AppState.chatFontSize || 14;
+            document.getElementById('chat-font-size-value').innerText = (AppState.chatFontSize || 14) + 'px';
+
+            document.getElementById('input-chat-font-size').oninput = function() {
+                AppState.chatFontSize = parseInt(this.value);
+                document.getElementById('chat-font-size-value').innerText = this.value + 'px';
+                applyChatFontSize();
+            };
+            document.getElementById('input-chat-font-size').onchange = function() {
+                saveConfig();
+            };
 
             document.getElementById('chk-liquid-glass').onchange = function() {
                 AppState.liquidGlassEnabled = this.checked;
@@ -3559,6 +3678,8 @@ nav {
             applyCustomCss();
             renderStatusTexts();
             runStatusRotationDaemon();
+            initStableKeepAlive();
+            applyChatFontSize();
             
             document.getElementById('avatar-my').src = AppState.myProfile.avatar;
             document.getElementById('name-my').value = AppState.myProfile.name;
@@ -3989,6 +4110,12 @@ nav {
 
             document.getElementById('chk-notification-enabled').onchange = function() {
                 toggleNotificationSetting(this.checked);
+            };
+
+            document.getElementById('chk-wakelock-enabled').onchange = function() {
+                AppState.wakeLockEnabled = this.checked;
+                saveConfig();
+                if (this.checked) { requestWakeLockIfNeeded(); } else { releaseWakeLock(); }
             };
 
             document.getElementById('btn-add-period-record').onclick = () => openPeriodRecordModal();
