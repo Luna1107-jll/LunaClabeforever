@@ -1051,8 +1051,11 @@
                         <div class="settings-card-title">☁️ 服务器推送（息屏也能收到提醒）</div>
                         <div class="settings-card-desc">需要先按教程部署好推送服务器（Cloudflare Worker），把生成的网址填在下面。填好后点"保存并订阅"，此后哪怕锁屏/App被系统冻结，到点也能收到一条"有新消息"的系统通知，点开 App 后内容会正常生成。</div>
                         <input type="text" id="input-push-worker-url" placeholder="粘贴 Worker 网址，例如 https://xxx.workers.dev" style="width:100%; padding:8px; margin-bottom:8px; border:1px solid var(--border-color); border-radius:6px; font-size:0.78rem; box-sizing:border-box;">
-                        <button class="btn btn-accent" id="btn-save-subscribe-push">保存并订阅</button>
-                        <div id="push-subscribe-status" style="font-size:0.72rem; color:var(--text-muted); margin-top:8px;"></div>
+                        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                            <button class="btn btn-accent" id="btn-save-subscribe-push">保存并订阅</button>
+                            <button class="btn" id="btn-check-push-status">🔍 检测推送状态</button>
+                        </div>
+                        <div id="push-subscribe-status" style="font-size:0.72rem; color:var(--text-muted); margin-top:8px; white-space:pre-wrap;"></div>
                     </div>
 
                 </div>
@@ -1541,6 +1544,52 @@
             } catch (e) { /* 静默失败：不影响本地功能，下次时间表更新时会自动重试 */ }
         }
 
+        function formatPushTimestamp(ms) {
+            if (!ms) return '无';
+            const d = new Date(ms);
+            return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+        }
+
+        async function checkPushStatus() {
+            const statusEl = document.getElementById('push-subscribe-status');
+            const workerUrl = getPushWorkerUrl() || document.getElementById('input-push-worker-url').value.trim().replace(/\/+$/, '');
+            if (!workerUrl) { statusEl.textContent = '❌ 请先填写并保存 Worker 网址'; return; }
+            statusEl.textContent = '⏳ 正在查询...';
+            try {
+                const resp = await fetch(workerUrl + '/status');
+                if (!resp.ok) throw new Error('服务器返回状态码 ' + resp.status);
+                const data = await resp.json();
+
+                const lines = [];
+                lines.push(data.hasSubscription ? '✅ 服务器已保存订阅信息' : '❌ 服务器没有保存任何订阅信息，请先点"保存并订阅"');
+
+                if (data.schedule) {
+                    lines.push(`📅 下次聊天推送计划：${formatPushTimestamp(data.schedule.chatNextTime)}`);
+                    lines.push(`📅 下次信件推送计划：${formatPushTimestamp(data.schedule.letterNextTime)}`);
+                } else {
+                    lines.push('📅 服务器暂无排期记录（可能还没触发过一次消息生成）');
+                }
+
+                if (data.lastPushLog) {
+                    const log = data.lastPushLog;
+                    const resultText = {
+                        success: '✅ 上一次推送成功',
+                        retry_later: `⚠️ 上一次推送失败（状态码 ${log.status}），会自动重试`,
+                        error: `⚠️ 上一次推送出错：${log.message}`,
+                        subscription_gone: '❌ 订阅已失效（可能是清了缓存/换了浏览器），请重新点"保存并订阅"',
+                        skip: `ℹ️ ${log.reason || ''}`
+                    }[log.result] || '';
+                    lines.push(`🕐 最近一次尝试：${formatPushTimestamp(log.at)}　${resultText}`);
+                } else {
+                    lines.push('🕐 服务器还没有执行过任何一次定时推送任务');
+                }
+
+                statusEl.textContent = lines.join('\n');
+            } catch (e) {
+                statusEl.textContent = '❌ 查询失败：' + e.message;
+            }
+        }
+
         async function attemptServiceWorkerRegistration() {
             const statusEl = document.getElementById('keepalive-status-desc');
             if (!('serviceWorker' in navigator)) {
@@ -1675,7 +1724,10 @@
         function bindEmojiEvents(element, emojiId, onClickAction) {
             let timer;
             let isLong = false;
-            
+            let moved = false;
+            let touchStartX = 0, touchStartY = 0;
+            const MOVE_THRESHOLD = 10; // 超过这个像素距离视为滑动/滚动，不触发点击
+
             const triggerDelete = () => {
                 isLong = true;
                 showEmojiDeleteConfirm(emojiId);
@@ -1685,15 +1737,28 @@
             element.onmouseup = () => { clearTimeout(timer); if(!isLong && onClickAction) onClickAction(); };
             element.onmouseleave = () => clearTimeout(timer);
 
-            element.ontouchstart = () => { isLong = false; timer = setTimeout(triggerDelete, 600); };
+            element.ontouchstart = (e) => {
+                isLong = false;
+                moved = false;
+                const t = e.touches[0];
+                touchStartX = t.clientX;
+                touchStartY = t.clientY;
+                timer = setTimeout(triggerDelete, 600);
+            };
+            element.ontouchmove = (e) => {
+                const t = e.touches[0];
+                if (Math.abs(t.clientX - touchStartX) > MOVE_THRESHOLD || Math.abs(t.clientY - touchStartY) > MOVE_THRESHOLD) {
+                    moved = true;
+                    clearTimeout(timer);
+                }
+            };
             element.ontouchend = (e) => { 
                 clearTimeout(timer); 
-                if(!isLong && onClickAction) { 
+                if(!isLong && !moved && onClickAction) { 
                     e.preventDefault(); 
                     onClickAction(); 
                 } 
             };
-            element.ontouchmove = () => clearTimeout(timer);
             element.oncontextmenu = (e) => { e.preventDefault(); };
         }
 
@@ -3831,10 +3896,12 @@ nav {
             document.getElementById('btn-export-txt').onclick = async () => {
                 let list = [];
                 await dbAction("cards", "readonly", store => {
-                    return new Promise(res => { store.openCursor().onsuccess = e => { const c = e.target.result; if(c) { if((c.value.cardType || 'text') === 'text') list.push(c.value.text); c.continue(); } else res(); }; });
+                    return new Promise(res => { store.openCursor().onsuccess = e => { const c = e.target.result; if(c) { if((c.value.cardType || 'text') === 'text') list.push({ group: c.value.group || '默认', text: c.value.text }); c.continue(); } else res(); }; });
                 });
                 if(list.length === 0) return alert("文字卡库空空如也");
-                const blob = new Blob(["\uFEFF" + list.join("\r\n")], { type: "text/plain;charset=utf-8" });
+                // 每行格式："分组名<TAB>卡片内容"，以保留分组信息；旧版无分组的纯文本文件仍可正常导入（自动归入默认分组）
+                const lines = list.map(item => `${item.group}\t${item.text}`);
+                const blob = new Blob(["\uFEFF" + lines.join("\r\n")], { type: "text/plain;charset=utf-8" });
                 const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `字卡数据包导出.txt`; a.click();
             };
 
@@ -3842,18 +3909,49 @@ nav {
                 const f = e.target.files[0]; if(!f) return;
                 const r = new FileReader();
                 r.onload = async (evt) => {
-                    const lines = evt.target.result.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-                    let succ = 0;
+                    const rawLines = evt.target.result.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+                    const parsed = rawLines.map(line => {
+                        const tabIdx = line.indexOf('\t');
+                        if (tabIdx > -1) {
+                            const g = line.slice(0, tabIdx).trim();
+                            const t = line.slice(tabIdx + 1).trim();
+                            return { group: g || '默认', text: t };
+                        }
+                        return { group: '默认', text: line }; // 兼容旧版无分组的纯文本导出
+                    }).filter(item => item.text.length > 0);
+
+                    // 收集已有卡片文本，用于真正过滤重复（不区分分组，避免同一句话重复入库）
+                    let existingTexts = new Set();
+                    await dbAction("cards", "readonly", store => {
+                        return new Promise(res => { store.openCursor().onsuccess = e => { const c = e.target.result; if(c) { if((c.value.cardType || 'text') === 'text') existingTexts.add(c.value.text); c.continue(); } else res(); }; });
+                    });
+
+                    let succ = 0, dup = 0;
+                    const newGroups = new Set();
                     await dbAction("cards", "readwrite", store => {
-                        return Promise.all(lines.map(line => {
+                        return Promise.all(parsed.map(item => {
                             return new Promise(res => {
-                                const req = store.add({ text: line, group: '默认', cardType: 'text', owner: 'all' });
+                                if (existingTexts.has(item.text)) { dup++; return res(); }
+                                existingTexts.add(item.text);
+                                if (item.group && item.group !== '默认') newGroups.add(item.group);
+                                const req = store.add({ text: item.text, group: item.group || '默认', cardType: 'text', owner: 'all' });
                                 req.onsuccess = () => { succ++; res(); }; 
                                 req.onerror = (err) => { err.preventDefault(); res(); };
                             });
                         }));
                     });
-                    alert(`成功过滤重复并导入 ${succ} 条字卡！`); renderCardList(); e.target.value = '';
+
+                    // 自动补齐导入数据里出现、但本地还没有的分组
+                    if (newGroups.size > 0) {
+                        let groupsChanged = false;
+                        newGroups.forEach(g => { if (!AppState.groups.includes(g)) { AppState.groups.push(g); groupsChanged = true; } });
+                        if (groupsChanged) saveConfig();
+                    }
+
+                    alert(`成功过滤重复 ${dup} 条，导入 ${succ} 条字卡（分组已保留）！`);
+                    renderCardManagementDOM();
+                    renderCardList();
+                    e.target.value = '';
                 };
                 r.readAsText(f);
             };
@@ -4270,6 +4368,7 @@ nav {
             };
 
             document.getElementById('btn-save-subscribe-push').onclick = subscribeAndSavePush;
+            document.getElementById('btn-check-push-status').onclick = checkPushStatus;
 
             document.getElementById('btn-save-proactive').onclick = () => {
                 const intervalVal = parseFloat(document.getElementById('input-proactive-interval').value);
