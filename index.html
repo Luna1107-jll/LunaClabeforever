@@ -1721,6 +1721,22 @@
             }
         }
 
+        // 表情格子滑动误触防护：只靠"手指位移是否超过阈值"在快速轻甩(flick)时会漏判——
+        // 甩得快的话手指实际移动距离很小，但触发的是真正的原生滚动。
+        // 这里改成直接监听格子容器本身的 scroll 事件，只要容器真的发生了滚动，
+        // 就在一小段时间内（350ms）屏蔽所有表情格子的点击/长按，从根源上判断"这是不是一次滚动"。
+        let emojiTouchGuardUntil = 0;
+        const activeEmojiTimerClears = new Set();
+
+        function installEmojiScrollGuard(container) {
+            if (!container || container.dataset.scrollGuardInstalled) return;
+            container.dataset.scrollGuardInstalled = '1';
+            container.addEventListener('scroll', () => {
+                emojiTouchGuardUntil = Date.now() + 350;
+                activeEmojiTimerClears.forEach(fn => fn());
+            }, { passive: true });
+        }
+
         function bindEmojiEvents(element, emojiId, onClickAction) {
             let timer;
             let isLong = false;
@@ -1728,8 +1744,11 @@
             let touchStartX = 0, touchStartY = 0;
             const MOVE_THRESHOLD = 10; // 超过这个像素距离视为滑动/滚动，不触发点击
 
+            const clearMyTimer = () => { clearTimeout(timer); activeEmojiTimerClears.delete(clearMyTimer); };
+
             const triggerDelete = () => {
                 isLong = true;
+                activeEmojiTimerClears.delete(clearMyTimer);
                 showEmojiDeleteConfirm(emojiId);
             };
 
@@ -1743,18 +1762,20 @@
                 const t = e.touches[0];
                 touchStartX = t.clientX;
                 touchStartY = t.clientY;
+                activeEmojiTimerClears.add(clearMyTimer);
                 timer = setTimeout(triggerDelete, 600);
             };
             element.ontouchmove = (e) => {
                 const t = e.touches[0];
                 if (Math.abs(t.clientX - touchStartX) > MOVE_THRESHOLD || Math.abs(t.clientY - touchStartY) > MOVE_THRESHOLD) {
                     moved = true;
-                    clearTimeout(timer);
+                    clearMyTimer();
                 }
             };
             element.ontouchend = (e) => { 
-                clearTimeout(timer); 
-                if(!isLong && !moved && onClickAction) { 
+                clearMyTimer();
+                const scrolling = Date.now() < emojiTouchGuardUntil;
+                if(!isLong && !moved && !scrolling && onClickAction) { 
                     e.preventDefault(); 
                     onClickAction(); 
                 } 
@@ -3861,6 +3882,9 @@ nav {
             runStatusRotationDaemon();
             initStableKeepAlive();
             applyChatFontSize();
+
+            installEmojiScrollGuard(document.getElementById('emoji-panel-grid-node'));
+            installEmojiScrollGuard(document.getElementById('card-list-box'));
             
             document.getElementById('avatar-my').src = AppState.myProfile.avatar;
             document.getElementById('name-my').value = AppState.myProfile.name;
