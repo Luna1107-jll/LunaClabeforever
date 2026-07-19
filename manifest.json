@@ -1,7 +1,9 @@
 {
-  "name": "Luna和Caleb的专属",
-  "short_name": "Caleb",
+  "id": "/index.html",
+  "name": "私人聊天空间",
+  "short_name": "聊天空间",
   "start_url": "./index.html",
+  "scope": "./",
   "display": "standalone",
   "background_color": "#f8f9fa",
   "theme_color": "#e5989b",
